@@ -1,15 +1,25 @@
 package com.swx.raft.common.entity;
 
+import lombok.Builder;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+import org.apache.log4j.Logger;
+
+import java.io.Serializable;
+
 /**
  *  RPC请求投票的参数 候选人向其他节点发起投票请求
  */
-public class RvoteParam {
+@Builder
+@Data
+public class RvoteParam implements Serializable {
     /**
      * 候选人的任期号
      */
     private long term;
     /**
-     * 请求者的ID
+     * 被请求者的ID(ip:selfport)
      */
     private String serverId;
     /**
@@ -25,5 +35,6 @@ public class RvoteParam {
      * 候选人最后日志条目的任期号
      */
     private long lastLogTerm;
+
 
 }
