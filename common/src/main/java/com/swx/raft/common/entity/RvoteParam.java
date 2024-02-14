@@ -10,7 +10,7 @@ import java.io.Serializable;
 
 /**
  *  RPC请求投票的参数 候选人向其他节点发起投票请求
- */
+        */
 @Builder
 @Data
 public class RvoteParam implements Serializable {
