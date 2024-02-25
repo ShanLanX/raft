@@ -1,9 +1,9 @@
 package com.swx.raft.common.entity;
 
 public class NodeStatus {
-    int FOLLOWER=0;
-    int CANDIDATE=1;
-    int LEADER=2;
+   public static int FOLLOWER=0;
+    public static int CANDIDATE=1;
+    public static int LEADER=2;
 
     enum Enum{
         FOLLOWER(0),CANDIDATE(1),LEADER(2);

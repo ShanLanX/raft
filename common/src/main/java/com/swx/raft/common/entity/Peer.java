@@ -1,5 +1,8 @@
 package com.swx.raft.common.entity;
 
+import lombok.Data;
+
+@Data
 public class Peer {
     private final String address;
 

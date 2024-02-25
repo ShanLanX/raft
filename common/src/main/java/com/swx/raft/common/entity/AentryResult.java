@@ -2,13 +2,15 @@ package com.swx.raft.common.entity;
 
 import lombok.Builder;
 import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
 
 import java.io.Serializable;
 @Data
 @Builder
 // xQS builder类没有构造
 public class AentryResult implements Serializable {
-    // xQS 为什么要更新
+
     /** 当前的任期号，用于领导人去更新自己 */
     long term;
 
