@@ -128,7 +128,7 @@ public class DefaultConsensus implements Consensus {
 
                 log.info("node {} append heartbeat success , he's term : {}, my term : {}", param.getLeaderId(), param.getTerm(), node.getCurrentTerm());
 
-                // 处理 leader 已提交但未应要到状态机的日志
+                // 处理 leader 已提交但未应用到节点状态机的日志
 
                 // 下一个需要提交的日志的索引
                 long nextCommit = node.getCommitIndex() + 1;
@@ -140,7 +140,7 @@ public class DefaultConsensus implements Consensus {
                     node.setLastApplied(commitIndex);
                 }
                 while (nextCommit <= node.getCommitIndex()) {
-                    // 提交 leadercommit 之前的日志，这些日志都是已提交，但未应用到状态机的日志
+                    // 提交 leadercommit 之前的日志
                     node.stateMachine.apply(node.logModule.read(nextCommit));
                     nextCommit++;
                 }

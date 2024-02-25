@@ -1,5 +1,6 @@
 package com.swx.raft.server.impl;
 
+import com.swx.raft.common.RaftRemoteException;
 import com.swx.raft.common.entity.*;
 import com.swx.raft.common.rpc.DefaultRpcClient;
 import com.swx.raft.common.rpc.Request;
@@ -13,15 +14,16 @@ import com.swx.raft.server.constant.StateMachineSaveType;
 import com.swx.raft.server.rpc.DefaultRpcServiceImpl;
 import com.swx.raft.server.rpc.RpcService;
 import com.swx.raft.server.thread.RaftThreadPool;
+import com.swx.raft.server.util.LongConvert;
 import lombok.Data;
+import lombok.extern.java.Log;
 import lombok.extern.slf4j.Slf4j;
 
-import java.util.ArrayList;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Future;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 @Data
 @Slf4j
@@ -45,6 +47,13 @@ public class DefaultNode implements Node,ClusterMembershipChanges {
     public final long heartBeatTick=5*100;
 
     private HeartBeatTask heartBeatTask=new HeartBeatTask();
+    private ElectionTask electionTask=new ElectionTask();
+
+    private ReplicationFailQueueConsumer replicationFailQueueConsumer = new ReplicationFailQueueConsumer();
+
+    private LinkedBlockingQueue<ReplicationFailModel> replicationFailQueue = new LinkedBlockingQueue<>(2048);
+
+
 
 
     /**
@@ -130,7 +139,18 @@ public class DefaultNode implements Node,ClusterMembershipChanges {
         consensus = new DefaultConsensus(this);
         delegate = new ClusterMembershipChangesImpl(this);
 
-        RaftThreadPool.scheduleWithFixedDelay(,500);
+        RaftThreadPool.scheduleWithFixedDelay(heartBeatTask,500);
+        RaftThreadPool.scheduleAtFixedRate(electionTask, 6000, 500);
+        RaftThreadPool.execute(replicationFailQueueConsumer);
+        LogEntry logEntry = logModule.getLast();
+        if (logEntry != null) {
+            currentTerm = logEntry.getTerm();
+        }
+
+        log.info("start success, selfId : {} ", peerSet.getSelf());
+
+
+
 
 
 
@@ -250,6 +270,103 @@ public class DefaultNode implements Node,ClusterMembershipChanges {
             log.info("peerList size : {}, peer list content : {}", peers.size(), peers);
 
             // 向其他节点发送投票请求
+            for(Peer peer:peerSet.getPeersWithOutSelf()){
+                futureArrayList.add(RaftThreadPool.submit(()->{
+                    long lastTerm=0L;
+                    LogEntry last=logModule.getLast();
+                    if(last!=null){
+                        lastTerm=last.getTerm();
+                    }
+                    RvoteParam param=RvoteParam.builder()
+                            .term(currentTerm)
+                            .candidateId(peerSet.getSelf().getAddress())
+                            .lastLogTerm(lastTerm)
+                            .lastLogIndex(LongConvert.convert(logModule.getLastIndex()))
+                            .build();
+                    Request request=Request.builder()
+                            .cmd(Request.R_VOTE)
+                            .obj(param)
+                            .url(peer.getAddress())
+                            .build();
+
+                    try {
+                        return getRpcClient().<RvoteResult>send(request);
+                    }
+                    catch (RaftRemoteException e){
+                        log.error("ElectionTask RPC Fail , URL : " + request.getUrl());
+                        return null;
+                    }
+
+                }));
+
+            }
+            AtomicInteger success2=new AtomicInteger(0);
+            CountDownLatch latch=new CountDownLatch(futureArrayList.size());
+            for(Future<RvoteResult> future:futureArrayList){
+                RaftThreadPool.submit(()->{
+                    try{
+                        RvoteResult result=future.get(3000, TimeUnit.MILLISECONDS);
+                        if(result==null)
+                            return -1;
+                        boolean isVoteGranted=result.isVoteGranted();
+                        if(isVoteGranted){
+                            success2.incrementAndGet();
+                        }
+                        else {
+                            long resTerm=result.getTerm();
+                            // xQS 为什么要更新当前任期
+                            if(resTerm>=currentTerm){
+                                currentTerm=resTerm;
+
+                            }
+                        }
+                        return 0;
+
+                    }
+                    catch (Exception e){
+                        log.error("future get exception , e :  ",e);
+                        return -1;
+
+
+                    }
+                    finally {
+                        latch.countDown();
+                    }
+
+                });
+            }
+
+            try{
+                latch.await(3500,TimeUnit.MILLISECONDS);
+
+
+            }
+            catch (InterruptedException e){
+                log.warn("InterruptedException By Master election Task");
+            }
+
+            int success= success2.get();
+            log.info("node {} maybe become leader , success count = {} , status : {}", peerSet.getSelf(), success, NodeStatus.Enum.value(status));
+            // 如果投票期间,有其他服务器发送 appendEntry , 就可能变成 follower ,这时,应该停止.
+            if (status == NodeStatus.FOLLOWER) {
+                return;
+            }
+            // 加上自身. 如果
+            if (success >= peers.size() / 2) {
+                log.warn("node {} become leader ", peerSet.getSelf());
+                status = NodeStatus.LEADER;
+                peerSet.setLeader(peerSet.getSelf());
+                votedFor = "";
+                becomeLeaderToDoThing();
+            } else {
+                // else 重新选举
+                votedFor = "";
+            }
+            // 再次更新选举时间
+            preElectionTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextInt(200) + 150;
+
+
+
 
 
 
@@ -258,6 +375,165 @@ public class DefaultNode implements Node,ClusterMembershipChanges {
 
 
         }
+    }
+
+    /**
+     * 日志复制失败队列，等待被消费
+     */
+    class ReplicationFailQueueConsumer implements Runnable {
+        long intervalTime=1000*60;
+
+        @Override
+        public void run() {
+            while (running){
+                try{
+                    ReplicationFailModel model = replicationFailQueue.poll(1000, MILLISECONDS);
+                    if(model==null){
+                        continue;
+                    }
+                    if(status!=NodeStatus.LEADER){
+                        // xQs 是否应该被清空
+                        replicationFailQueue.clear();
+                        continue;
+                    }
+                    log.warn("replication Fail Queue Consumer take a task, will be retry replication, content detail : [{}]", model.logEntry);
+                    long offerTime = model.offerTime;
+
+                    // 元素offer时间与当前时间只差超过间隔
+                    if (System.currentTimeMillis() - offerTime > intervalTime) {
+                        log.warn("replication Fail event Queue maybe full or handler slow");
+                    }
+                    Callable callable = model.callable;
+                    Future<Boolean> future = RaftThreadPool.submit(callable);
+                    Boolean r = future.get(3000, MILLISECONDS);
+                    // 重试成功.
+                    if (r) {
+                        // 可能有资格应用到状态机.
+                        tryApplyStateMachine(model);
+                    }
+
+
+
+
+
+
+                }
+                catch (InterruptedException e) {
+                    // ignore
+                } catch (ExecutionException | TimeoutException e) {
+                    log.warn(e.getMessage());
+                }
+
+            }
+
+        }
+    }
+
+
+
+    /**
+     * 初始化所有的nextIndex为当前最后一条日志的index+1，如果下次RPC时，跟随着和leader不一致就会导致失败
+     * 那么leader尝试递减nextIndex 并进行重试，试图达到最终一致
+     *
+     */
+
+    private  void becomeLeaderToDoThing(){
+
+        nextIndexs=new ConcurrentHashMap<>();
+        matchIndexs=new ConcurrentHashMap<>();
+        for(Peer peer:peerSet.getPeersWithOutSelf()){
+            nextIndexs.put(peer, logModule.getLastIndex()+1);
+            matchIndexs.put(peer,0L);
+        }
+        //
+        //  创建空白日志并提交，用于处理前任领导未提交的日志，可在一致性模块中的appendEntry那里看到
+        LogEntry logEntry=LogEntry.builder()
+                .command(null)
+                .term(currentTerm)
+                .build();
+
+        //  提交到的本地日志 这里的处理会让logEntry获取到logIndex
+        logModule.write(logEntry);
+
+        log.info("write logModule success, logEntry info : {}, log index : {}", logEntry, logEntry.getIndex());
+        final AtomicInteger success=new AtomicInteger(0);
+        List<Future<Boolean>> futureList=new ArrayList<>();
+        int count=0;
+        // 复制到其他机器
+        for(Peer peer:peerSet.getPeersWithOutSelf()){
+            count++;
+            futureList.add(replication(peer,logEntry));
+        }
+
+        CountDownLatch latch=new CountDownLatch(futureList.size());
+        List<Boolean> resultList=new CopyOnWriteArrayList<>();
+
+        getRPCAppendResult(futureList,latch,resultList);
+
+        try{
+            latch.await(4000,TimeUnit.MILLISECONDS);
+        }
+        catch (Exception e){
+            log.error(e.getMessage());
+        }
+
+        for (Boolean aBoolean : resultList) {
+            if (aBoolean) {
+                success.incrementAndGet();
+            }
+        }
+
+        // 如果存在一个满足N > commitIndex的 N，并且大多数的matchIndex[i] ≥ N成立，
+        // 并且log[N].term == currentTerm成立，那么令 commitIndex 等于这个 N （5.3 和 5.4 节）
+
+        List<Long> matchIndexList = new ArrayList<>(matchIndexs.values());
+
+        int median=0;
+        while(matchIndexList.size()>=2){
+            Collections.sort(matchIndexList);
+            median=matchIndexList.size()/2;
+        }
+        Long N=matchIndexList.get(median);
+        if(N>commitIndex){
+            LogEntry entry=logModule.read(N);
+            if(entry!=null&&entry.getTerm()==currentTerm){
+                commitIndex=N;
+            }
+        }
+        // 超越一半的节点成功
+        if(success.get()>=(count/2)){
+
+            commitIndex=logEntry.getIndex();
+            // 应用到状态机 空日志会被忽略
+            getStateMachine().apply(logEntry);
+            lastApplied=commitIndex;
+            log.info("success apply local state machine,  logEntry info : {}", logEntry);
+        }
+        else{
+
+            // 回滚之前提交的日志
+            logModule.removeOnStartIndex(logEntry.getIndex());
+            log.warn("fail apply local state  machine,  logEntry info : {}", logEntry);
+
+            // 无法提交空日志，让出领导者位置
+            log.warn("node {} becomeLeaderToDoThing fail ", peerSet.getSelf());
+            status = NodeStatus.FOLLOWER;
+            peerSet.setLeader(null);
+            votedFor = "";
+
+
+        }
+
+
+
+
+
+
+
+
+
+
+
     }
 
     /**
@@ -326,7 +602,7 @@ public class DefaultNode implements Node,ClusterMembershipChanges {
                             status=NodeStatus.FOLLOWER;
                             return false;
                         }
-                        // 对方日期没有自己大却失败了，说明term不对或者index不对
+                        // 对方任期没有自己大却失败了，说明term不对或者index不对
                         else{
 
                             // 减少nextIndex
@@ -372,6 +648,38 @@ public class DefaultNode implements Node,ClusterMembershipChanges {
 
         }
         return entry;
+    }
+
+    private void getRPCAppendResult(List<Future<Boolean>> futureList,CountDownLatch latch,List<Boolean> result){
+        for(Future<Boolean> future:futureList){
+            RaftThreadPool.execute(()->{
+                try {
+                    result.add(future.get(3000,TimeUnit.MILLISECONDS));
+                } catch (Exception e){
+                    log.error(e.getMessage());
+                    result.add(false);
+                }
+                finally {
+                    latch.countDown();
+                }
+            });
+
+        }
+
+    }
+
+    // xQS 这里的作用是什么
+    private void tryApplyStateMachine(ReplicationFailModel model){
+        String success = stateMachine.getString(model.successKey);
+        stateMachine.setString(model.successKey, String.valueOf(Integer.parseInt(success) + 1));
+
+        String count = stateMachine.getString(model.countKey);
+
+        if (Integer.parseInt(success) >= Integer.parseInt(count) / 2) {
+            stateMachine.apply(model.logEntry);
+            stateMachine.delString(model.countKey, model.successKey);
+        }
+
     }
 
 
