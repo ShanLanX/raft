@@ -33,6 +33,13 @@ public interface Node extends LifeCycle {
      */
     ClientKVAck handlerClientRequest(ClientKVReq request);
 
+    /**
+     * 转发给 leader 节点.
+     * @param request
+     * @return
+     */
+    ClientKVAck redirect(ClientKVReq request);
+
 
 
 

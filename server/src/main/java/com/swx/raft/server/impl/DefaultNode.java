@@ -181,6 +181,139 @@ public class DefaultNode implements Node,ClusterMembershipChanges {
 
     }
 
+    @Override
+    public RvoteResult handlerRequestVote(RvoteParam param) {
+        log.warn("handlerRequestVote will be invoke , param :{}",param);
+        return consensus.requestVote(param);
+    }
+
+
+
+
+    @Override
+    public AentryResult handlerAppendEntries(AentryParam param) {
+        log.warn("handlerAppendEntries will be invoke, param :{}",param);
+        return consensus.appendEntries(param);
+    }
+
+    public ClientKVAck redirect(ClientKVReq request) {
+        Request r = Request.builder()
+                .obj(request)
+                .url(peerSet.getLeader().getAddress())
+                .cmd(Request.CLIENT_REQ).build();
+
+        return rpcClient.send(r);
+    }
+
+    /**
+     * 处理来自客户端的请求，客户端的请求包含一条被复制状态机执行的指令
+     * 领导人把指令当作一条新的日志附加到日志上，然后并发的发起附加条目的RPC到其他跟随着者让他们复制这条日志
+     * 当这条日志条目被安全的复制（下面会介绍），领导人会应用这条日志条目到它的状态机中然后把执行的结果返回给客户端。（有应用到状态机的过程）
+     * 如果跟随者崩溃或者运行缓慢，再或者网络丢包，
+     * 领导人会不断的重复尝试附加日志条目 RPCs （尽管已经回复了客户端）直到所有的跟随者都最终存储了所有的日志条目。
+     * @param request
+     * @return
+     */
+
+    @Override
+    public synchronized ClientKVAck handlerClientRequest(ClientKVReq request) {
+        log.warn("handlerClientRequest handler {} operation,  and key : [{}], value : [{}]",
+                ClientKVReq.Type.value(request.getType()), request.getKey(), request.getValue());
+
+        if(status!=NodeStatus.LEADER){
+            log.warn("I not am leader , only invoke redirect method, leader addr : {}, my addr : {}",
+                    peerSet.getLeader(), peerSet.getSelf().getAddress());
+            return redirect(request);
+
+
+
+        }
+        if(request.getType()==ClientKVReq.GET){
+            LogEntry logEntry=stateMachine.get(request.getKey());
+            if(logEntry!=null){
+                return new ClientKVAck(logEntry);
+            }
+            return new ClientKVAck(null);
+
+        }
+        LogEntry logEntry=LogEntry.builder()
+                .command(Command.builder().key(request.getKey()).value(request.getValue()).build())
+                .term(currentTerm)
+                .build();
+
+        // 提交到本地日志
+        logModule.write(logEntry);
+        log.info("write logModule success, logEntry info : {}, log index : {}", logEntry, logEntry.getIndex());
+        final AtomicInteger success = new AtomicInteger(0);
+        List<Future<Boolean>> futureList = new ArrayList<>();
+        int count = 0;
+        //  复制到其他机器
+        for (Peer peer : peerSet.getPeersWithOutSelf()) {
+            // TODO check self and RaftThreadPool
+            count++;
+            // 并行发起 RPC 复制.
+            futureList.add(replication(peer, logEntry));
+        }
+        CountDownLatch latch=new CountDownLatch(futureList.size());
+        List<Boolean> resultList=new CopyOnWriteArrayList<>();
+        getRPCAppendResult(futureList,latch,resultList);
+        try{
+            latch.await(4000, MILLISECONDS);
+
+        }catch (InterruptedException e){
+            log.error(e.getMessage());
+        }
+
+        for (Boolean aBoolean : resultList) {
+            if (aBoolean) {
+                success.incrementAndGet();
+            }
+        }
+
+
+        // 如果存在一个满足N > commitIndex的 N，并且大多数的matchIndex[i] ≥ N成立，
+        // 并且log[N].term == currentTerm成立，那么令 commitIndex 等于这个 N （5.3 和 5.4 节）
+        List<Long> matchIndexList = new ArrayList<>(matchIndexs.values());
+        // 小于 2, 没有意义
+        int median = 0;
+        if (matchIndexList.size() >= 2) {
+            Collections.sort(matchIndexList);
+            median = matchIndexList.size() / 2;
+        }
+        Long N = matchIndexList.get(median);
+        if (N > commitIndex) {
+            LogEntry entry = logModule.read(N);
+            if (entry != null && entry.getTerm() == currentTerm) {
+                commitIndex = N;
+            }
+        }
+
+        //  响应客户端(成功一半)
+        if (success.get() >= (count / 2)) {
+            // 更新
+            commitIndex = logEntry.getIndex();
+            //  应用到状态机
+            getStateMachine().apply(logEntry);
+            lastApplied = commitIndex;
+
+            log.info("success apply local state machine,  logEntry info : {}", logEntry);
+            // 返回成功.
+            return ClientKVAck.ok();
+        } else {
+            // 回滚已经提交的日志.
+            logModule.removeOnStartIndex(logEntry.getIndex());
+            log.warn("fail apply local state  machine,  logEntry info : {}", logEntry);
+            // TODO 不应用到状态机,但已经记录到日志中.由定时任务从重试队列取出,然后重复尝试,当达到条件时,应用到状态机.
+            // 这里应该返回错误, 因为没有成功复制过半机器.
+            return ClientKVAck.fail();
+        }
+
+
+
+
+
+    }
+
     class HeartBeatTask implements  Runnable{
 
         @Override
@@ -650,6 +783,12 @@ public class DefaultNode implements Node,ClusterMembershipChanges {
         return entry;
     }
 
+    /**
+     * 获取rpc结果
+     * @param futureList
+     * @param latch
+     * @param result
+     */
     private void getRPCAppendResult(List<Future<Boolean>> futureList,CountDownLatch latch,List<Boolean> result){
         for(Future<Boolean> future:futureList){
             RaftThreadPool.execute(()->{

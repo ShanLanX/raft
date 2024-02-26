@@ -5,7 +5,7 @@ public class NodeStatus {
     public static int CANDIDATE=1;
     public static int LEADER=2;
 
-    enum Enum{
+    public enum Enum{
         FOLLOWER(0),CANDIDATE(1),LEADER(2);
         int code;
         Enum(int code){

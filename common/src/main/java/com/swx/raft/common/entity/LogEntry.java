@@ -13,6 +13,10 @@ import java.io.Serializable;
 public class LogEntry implements Serializable,Comparable {
     private long term;
     private Long index;
+
+    /**
+     * 保存的是kV
+     */
     private Command command;
 
     @Override

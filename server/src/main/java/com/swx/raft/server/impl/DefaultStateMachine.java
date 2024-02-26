@@ -120,6 +120,8 @@ public class DefaultStateMachine implements StateMachine {
                 return;
             }
             String key = command.getKey();
+
+
             machineDb.put(key.getBytes(), JSON.toJSONBytes(logEntry));
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
